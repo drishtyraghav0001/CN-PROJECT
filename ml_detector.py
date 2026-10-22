@@ -3,7 +3,7 @@ import pandas as pd
 from sklearn.ensemble import IsolationForest
 
 
-def detect_anomalies(df):
+def detect_anomalies(df, use_engineered_features=False, contamination=0.1):
     data = df.copy()
 
     # Select numerical features available in the dataset
@@ -13,6 +13,13 @@ def detect_anomalies(df):
         "duration",
         "source_port"
     ]
+
+    if use_engineered_features:
+        feature_candidates.extend([
+            "packets_per_sec",
+            "bytes_per_sec",
+            "bytes_per_packet"
+        ])
 
     feature_cols = [
         col for col in feature_candidates
@@ -34,7 +41,8 @@ def detect_anomalies(df):
         errors="coerce"
     )
 
-    # Handle missing or invalid values
+    # Pre-ML NaN handling: Impute missing or invalid values (such as rate features
+    # where duration <= 0 or missing) with the column median, and 0 fallback if all are NaN.
     features = features.fillna(
         features.median()
     ).fillna(0)
@@ -42,7 +50,7 @@ def detect_anomalies(df):
     # Train the Isolation Forest model
     model = IsolationForest(
         n_estimators=100,
-        contamination=0.1,
+        contamination=float(contamination),
         random_state=42
     )
 

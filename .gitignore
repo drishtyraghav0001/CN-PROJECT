@@ -4,3 +4,8 @@ __pycache__/
 *.pyc
 .env
 .streamlit/secrets.toml
+ensemble_model.joblib
+data/*.csv
+data/cic/
+cic_sample.csv
+__pycache__/
