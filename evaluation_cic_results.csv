@@ -1,0 +1,20 @@
+Dataset,Method,Accuracy,Precision,Recall,F1,FPR,TP,FP,TN,FN
+CIC-IDS2017 (Canadian Institute for Cybersecurity),Statistical Detector (Mean + Std),0.4969,0.4935,0.1026,0.1699,0.1061,868,891,7509,7590
+CIC-IDS2017 (Canadian Institute for Cybersecurity),Statistical Detector (Median + MAD),0.5735,0.5416,0.9765,0.6967,0.8323,8259,6991,1409,199
+CIC-IDS2017 (Canadian Institute for Cybersecurity),Isolation Forest (Semi-Supervised),0.5459,0.6621,0.1937,0.2997,0.0995,1638,836,7564,6820
+CIC-IDS2017 (Canadian Institute for Cybersecurity),Isolation Forest (Unsupervised),0.4445,0.2247,0.0437,0.0732,0.152,370,1277,7123,8088
+CIC-IDS2017 (Canadian Institute for Cybersecurity),"Random Forest (Supervised, threshold 0.5)",0.986,0.9824,0.9898,0.9861,0.0179,8372,150,8250,86
+CIC-IDS2017 (Canadian Institute for Cybersecurity),"Random Forest (Supervised, target FPR 0.1%)",0.8709,0.9984,0.7438,0.8525,0.0012,6291,10,8390,2167
+CIC-IDS2017 (Canadian Institute for Cybersecurity),"Random Forest (Supervised, target FPR 0.5%)",0.9623,0.9927,0.9318,0.9613,0.0069,7881,58,8342,577
+CIC-IDS2017 (Canadian Institute for Cybersecurity),"Random Forest (Supervised, target FPR 1%)",0.9801,0.9881,0.9721,0.98,0.0118,8222,99,8301,236
+CIC-IDS2017 (Canadian Institute for Cybersecurity),"Random Forest (Supervised, target FPR 5%)",0.9726,0.9491,0.9989,0.9734,0.0539,8449,453,7947,9
+CIC-IDS2017 (Canadian Institute for Cybersecurity),"Gradient Boosting (Supervised, threshold 0.5)",0.9842,0.979,0.9898,0.9844,0.0214,8372,180,8220,86
+CIC-IDS2017 (Canadian Institute for Cybersecurity),"Gradient Boosting (Supervised, target FPR 0.1%)",0.9089,0.998,0.8201,0.9003,0.0017,6936,14,8386,1522
+CIC-IDS2017 (Canadian Institute for Cybersecurity),"Gradient Boosting (Supervised, target FPR 0.5%)",0.9406,0.9952,0.8859,0.9374,0.0043,7493,36,8364,965
+CIC-IDS2017 (Canadian Institute for Cybersecurity),"Gradient Boosting (Supervised, target FPR 1%)",0.9771,0.9885,0.9656,0.9769,0.0113,8167,95,8305,291
+CIC-IDS2017 (Canadian Institute for Cybersecurity),"Gradient Boosting (Supervised, target FPR 5%)",0.9752,0.9533,0.9995,0.9759,0.0493,8454,414,7986,4
+CIC-IDS2017 (Canadian Institute for Cybersecurity),"RF+GB Ensemble (Supervised, threshold 0.5)",0.9857,0.9809,0.9908,0.9858,0.0194,8380,163,8237,78
+CIC-IDS2017 (Canadian Institute for Cybersecurity),"RF+GB Ensemble (Supervised, target FPR 0.1%)",0.8939,0.9987,0.7897,0.8819,0.0011,6679,9,8391,1779
+CIC-IDS2017 (Canadian Institute for Cybersecurity),"RF+GB Ensemble (Supervised, target FPR 0.5%)",0.9601,0.9924,0.9276,0.9589,0.0071,7846,60,8340,612
+CIC-IDS2017 (Canadian Institute for Cybersecurity),"RF+GB Ensemble (Supervised, target FPR 1%)",0.9805,0.9878,0.9733,0.9805,0.0121,8232,102,8298,226
+CIC-IDS2017 (Canadian Institute for Cybersecurity),"RF+GB Ensemble (Supervised, target FPR 5%)",0.9725,0.9483,0.9996,0.9733,0.0549,8455,461,7939,3

@@ -5,81 +5,85 @@ FlowWatch is a Computer Networks project that analyzes network traffic, flags un
 
 ## Features
 - **Two data-source modes**
-  - File upload: CSV, JSON, PCAP/PCAPNG (packets are aggregated into flows with Scapy), and UNSW-NB15-format CSVs (mapped automatically).
-  - Live monitoring: continuous capture with no timer, analysed over a rolling window with start/stop controls. Only flow statistics are kept; payloads are never stored.
-- **Detectors**
-  - Statistical detector on packet count (mean + std, or robust median + MAD).
-  - Isolation Forest on all available numeric features.
-  - Supervised RF + Gradient Boosting ensemble with precision-focused operating points (UNSW-format files only).
-- **Feature engineering:** packets/sec, bytes/sec and bytes/packet, computed only when the required columns exist (no division by zero).
-- **Explainable flags:** each flagged record shows which method flagged it (Statistical / ML / Both), a severity level, and a reason built only from calculated feature deviations.
-- **Dashboard tabs:** Overview, Traffic Analytics, Anomaly Investigation, Model Comparison, Evaluation, Reports.
-- **Sidebar controls:** std multiplier, baseline mode, ML contamination, engineered-features toggle, protocol and flagged-by filters, live-monitoring window and refresh rate, ensemble operating point.
-- **Evaluation on labelled data:** precision, recall, F1, false-positive rate and per-category recall via `evaluation.py`.
-- **Exports:** CSV of the full comparison report and of flagged records.
+  - File upload: CSV, JSON, PCAP/PCAPNG (packets are aggregated into 5-tuple flows with Scapy), and UNSW-NB15/CIC-IDS2017 format CSVs (mapped automatically).
+  - Live monitoring: continuous real-time capture with Scapy `AsyncSniffer`, auto-discovered Windows network interfaces, rolling flow statistics, time-series traffic rate tracking, and an audit-ready session alert history log.
+- **Three-Tier Detection Engine**
+  - Multi-feature statistical detector across continuous metrics (packets, bytes, duration, packets/sec, bytes/sec, bytes/packet) with Bonferroni multiple-testing control and Mean+Std or robust Median+MAD baselines.
+  - Isolation Forest on all numerical traffic features with automated median imputation.
+  - Supervised Ensembles (Random Forest + Gradient Boosting):
+    - Extended feature ensemble for full UNSW-NB15 datasets (60 features).
+    - Flow-level ensemble (`flow_ensemble_model.joblib`) compatible with standard PCAP and live capture features.
+- **Feature engineering:** packets/sec, bytes/sec and bytes/packet, computed safely without division by zero.
+- **Explainable flags:** attribution (Statistical / ML / Both / None), severity grading (Low / Medium / High), and human-readable reason strings built from calculated feature deviations.
+- **Dashboard tabs:** Overview, Traffic Analytics (with real-time temporal trend charts in live mode), Anomaly Investigation (with persistent session alert log), Model Comparison, Evaluation (multi-dataset switcher between UNSW-NB15 and CIC-IDS2017), Reports.
+- **Sidebar controls:** std multiplier, baseline mode, Bonferroni adjustment toggle, ML contamination, engineered-features toggle, protocol and flagged-by filters, live monitoring window/refresh rate, interface selector, and ensemble operating points.
+- **Multi-dataset evaluation:** Precision, recall, F1, false-positive rate, and per-category attack recall across both UNSW-NB15 and CIC-IDS2017 benchmarks.
+- **Exports:** CSV of full comparison reports, flagged anomalies, and live session alert logs.
 
 ## Technologies
-Python, Streamlit, Pandas, NumPy, Scikit-learn, Scapy, Joblib, Npcap (Windows, for live capture).
+Python, Streamlit, Pandas, NumPy, Scikit-learn, Scapy, Joblib, SciPy, Npcap (Windows, for live capture).
 
 ## How to Run
 ```bash
 pip install -r requirements.txt
 python -m streamlit run model_dashboard.py
 ```
-For live monitoring on Windows, install [Npcap](https://npcap.com) (WinPcap API-compatible mode) and run the terminal as Administrator. Only monitor traffic you are authorized to capture.
+For live monitoring on Windows, install [Npcap](https://npcap.com) (WinPcap API-compatible mode) and run the terminal as Administrator. The dashboard automatically discovers available network adapters (e.g. Wi-Fi, Ethernet).
 
-Run the evaluation (optional; needs the UNSW-NB15 train and test CSVs in `data/`):
+Run verification tests:
 ```bash
-python evaluation.py
+python test_suite.py
 ```
-This writes `evaluation_results.csv`, `evaluation_results.json` and `ensemble_model.joblib`, which the dashboard uses.
+
+Run benchmarks (optional; uses datasets in `data/`):
+```bash
+python evaluation.py       # Evaluates UNSW-NB15
+python evaluate_cic.py     # Evaluates CIC-IDS2017
+```
 
 ## Project Structure
-- `model_dashboard.py` — Streamlit dashboard
-- `data_loader.py`, `pcap_loader.py` — file input loading
-- `live_monitor.py` — continuous live capture and rolling flow aggregation
-- `statistical_detector.py`, `ml_detector.py` — statistical and Isolation Forest detectors
-- `feature_engineering.py` — rate and volume features
-- `explainability.py` — reasons, flagged-by, severity
-- `evaluation.py` — labelled-data evaluation and ensemble training
-- `generate_sample_pcap.py` — creates `sample_traffic.pcap`
-- `test_suite.py` — tests
+- `model_dashboard.py` — Multi-tab Streamlit dashboard
+- `data_loader.py`, `pcap_loader.py` — File input and PCAP streaming flow aggregation
+- `live_monitor.py` — Live capture sniffer, adapter auto-discovery, rolling statistics, alert log
+- `statistical_detector.py` — Multi-feature continuous statistical detector with Bonferroni correction
+- `ml_detector.py` — Isolation Forest anomaly detector
+- `feature_engineering.py` — Rate and volume feature engineering
+- `explainability.py` — Deviation calculations, human-readable reason strings, severity grading
+- `evaluation.py` — UNSW-NB15 evaluation pipeline and extended ensemble
+- `evaluate_cic.py` — CIC-IDS2017 benchmark evaluation pipeline
+- `generate_sample_pcap.py` — Creates `sample_traffic.pcap`
+- `test_suite.py` — Verification test suite (10/10 tests passing)
 
 ## Evaluation
-`evaluation.py` trains on the UNSW-NB15 training split and reports metrics on the official test split (82,332 records: 37,000 normal, 45,332 attacks). Labels are never used as model features, and alert thresholds are chosen on held-out training data, never on the test set.
+
+### 1. UNSW-NB15 Benchmark
+Trained on the UNSW-NB15 training split (175,341 records) and evaluated on the official test split (82,332 records: 37,000 normal, 45,332 attacks).
 
 | Method | Precision | Recall | F1 | Test FPR |
 |---|---|---|---|---|
-| Statistical (Mean + Std) | 0.35 | 0.007 | 0.014 | 1.6% |
-| Isolation Forest (semi-supervised) | 0.79 | 0.445 | 0.570 | 14.2% |
-| Isolation Forest (extended features, 10% target) | 0.82 | 0.645 | 0.723 | 17.0% |
+| Statistical (Mean + Std) | 0.350 | 0.007 | 0.014 | 1.6% |
+| Isolation Forest (semi-supervised) | 0.793 | 0.445 | 0.570 | 14.2% |
+| Isolation Forest (extended features, 10% target) | 0.823 | 0.645 | 0.723 | 17.0% |
 | Random Forest (0.1% FPR target) | 0.997 | 0.793 | 0.883 | 0.3% |
 | Gradient Boosting (0.1% FPR target) | 0.993 | 0.847 | 0.915 | 0.7% |
-| RF+GB Ensemble (0.1% FPR target) | 0.997 | 0.826 | 0.904 | 0.3% |
-| RF+GB Ensemble (0.2% FPR target) | 0.993 | 0.859 | 0.921 | 0.7% |
-| RF+GB Ensemble (1% FPR target) | 0.962 | 0.910 | 0.935 | 4.4% |
+| RF+GB Extended Ensemble (0.1% FPR target) | 0.997 | 0.826 | 0.904 | 0.3% |
+| RF+GB Flow Ensemble (0.1% FPR target, live-compatible) | 0.998 | 0.665 | 0.798 | 0.15% |
+| RF+GB Flow Ensemble (1.0% FPR target, live-compatible) | 0.977 | 0.833 | 0.899 | 2.4% |
 
-Key findings:
-- Packet count alone is a weak signal: the statistical detectors detect almost no UNSW attacks.
-- Training Isolation Forest on all records (unsupervised) fails because UNSW's training set is about 68% attacks; fitting on normal traffic only is the fair setup.
-- Supervised models reach precision above 0.99 at strict thresholds. The RF+GB ensemble is slightly better than either model alone, but the differences are small and come from a single train/test split.
-- Test false-positive rates are 2 to 4 times higher than their targets because of UNSW-NB15's known train/test distribution shift. False-positive-rate targets transfer to the test set better than precision targets, because precision depends on the share of attacks.
-- Fuzzers are the hardest category (recall about 0.25 to 0.5 at strict thresholds).
-- Most important features for the Random Forest: `sttl`, `ct_state_ttl`, `bytes_per_sec`, `sload`, `packets_per_sec`.
+### 2. CIC-IDS2017 Benchmark
+Evaluated across all 8 traffic captures (DDoS, PortScan, DoS Hulk/GoldenEye/Slowloris, Patator, Web Attacks, Bot, Infiltration) on a balanced 56,193-record sampled subset (39,335 train / 16,858 test):
 
-If no real dataset is in `data/`, a small synthetic one is generated and clearly marked as synthetic; those results only demonstrate the method.
+| Method | Precision | Recall | F1 | Test FPR |
+|---|---|---|---|---|
+| Statistical (Mean + Std) | 0.494 | 0.103 | 0.170 | 10.6% |
+| Statistical (Median + MAD) | 0.542 | 0.977 | 0.697 | 83.2% |
+| Isolation Forest (Semi-Supervised) | 0.662 | 0.194 | 0.300 | 10.0% |
+| RF+GB Ensemble (0.1% FPR target) | 0.999 | 0.790 | 0.882 | 0.1% |
+| RF+GB Ensemble (1.0% FPR target) | 0.988 | 0.973 | 0.981 | 1.2% |
+| RF+GB Ensemble (threshold 0.5) | 0.981 | 0.991 | 0.986 | 1.9% |
 
 ## Limitations
 - Flow aggregation from PCAP and live capture is simplified, not a full NetFlow/Zeek pipeline.
-- The statistical detector tests packet count only.
-- Isolation Forest can flag a record on a feature combination no single feature explains, so some flagged rows have an empty reason.
-- The supervised ensemble needs UNSW-NB15-style features, so it applies to labelled UNSW-format files only, not to PCAP or live flows.
-- Supervised models only recognise attack types seen in training; Isolation Forest can flag novel behaviour, so FlowWatch presents both as a hybrid.
-- UNSW-NB15 is a lab-generated dataset; the results are not evidence of real-world performance.
-- Live monitoring needs Npcap and Administrator rights on Windows and should only be used on authorized traffic. Detection re-runs on a rolling window, so short windows give unstable statistics.
-
-## Future Improvements
-- Per-feature statistical detection.
-- Evaluation on additional datasets (e.g., CIC-IDS2017).
-- Time-based trend charts and an alert log for live monitoring.
-- A supervised model trained on features that live capture can actually produce.
+- Supervised models only recognise attack types represented in training data; Isolation Forest and statistical testing can flag novel unlabelled behaviour.
+- Both UNSW-NB15 and CIC-IDS2017 are lab-generated synthetic benchmarks; metrics demonstrate comparative model performance rather than guaranteed real-world deployment efficacy.
+- Live monitoring requires Administrator rights and Npcap on Windows and should strictly be run on authorized networks.

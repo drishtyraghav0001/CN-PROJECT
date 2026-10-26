@@ -1,4 +1,5 @@
 
+import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
 
@@ -43,6 +44,7 @@ def detect_anomalies(df, use_engineered_features=False, contamination=0.1):
 
     # Pre-ML NaN handling: Impute missing or invalid values (such as rate features
     # where duration <= 0 or missing) with the column median, and 0 fallback if all are NaN.
+    features = features.replace([np.inf, -np.inf], np.nan)
     features = features.fillna(
         features.median()
     ).fillna(0)

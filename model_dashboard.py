@@ -15,7 +15,7 @@ from explainability import add_explanations
 from feature_engineering import add_engineered_features
 from pcap_loader import load_pcap_data
 from statistical_detector import detect_statistical_anomalies
-from live_monitor import LiveMonitor
+from live_monitor import LiveMonitor, get_available_interfaces
 from evaluation import inspect_and_load_unsw, transform_with_spec
 
 st.set_page_config(page_title="FlowWatch", page_icon="🛡️", layout="wide")
@@ -49,6 +49,11 @@ def load_ensemble(path="ensemble_model.joblib"):
     return joblib.load(path) if os.path.exists(path) else None
 
 
+@st.cache_resource
+def load_flow_ensemble(path="flow_ensemble_model.joblib"):
+    return joblib.load(path) if os.path.exists(path) else None
+
+
 def auto_refresh(seconds):
     time.sleep(seconds)
     st.rerun()
@@ -68,15 +73,28 @@ uploaded_file = None
 window, refresh = 120, 5
 
 if live:
-    iface_mode = st.sidebar.radio("Network interface", ["Default interface", "Choose interface"])
-    iface = ""
-    if iface_mode == "Choose interface":
-        iface = st.sidebar.text_input("Interface name", placeholder=r"e.g. Wi-Fi or \Device\NPF_{...}")
-        if not iface.strip():
-            st.sidebar.caption("Enter a name, or switch back to Default interface.")
+    avail_ifaces = get_available_interfaces()
+    if avail_ifaces:
+        iface_options = ["Default interface"] + [i["label"] for i in avail_ifaces] + ["Manual input"]
+        iface_choice = st.sidebar.selectbox("Network interface", iface_options)
+        if iface_choice == "Default interface":
+            iface = ""
+            need_name = False
+        elif iface_choice == "Manual input":
+            iface = st.sidebar.text_input("Interface name / GUID", placeholder=r"e.g. \Device\NPF_{...}")
+            need_name = not bool(iface.strip())
+        else:
+            matched = next((i["name"] for i in avail_ifaces if i["label"] == iface_choice), iface_choice)
+            iface = matched
+            need_name = False
+    else:
+        iface_mode = st.sidebar.radio("Network interface", ["Default interface", "Choose interface"])
+        iface = ""
+        if iface_mode == "Choose interface":
+            iface = st.sidebar.text_input("Interface name", placeholder=r"e.g. Wi-Fi or \Device\NPF_{...}")
+        need_name = iface_mode == "Choose interface" and not iface.strip()
     window = st.sidebar.slider("Rolling window (seconds)", 30, 600, 120, 10)
     refresh = st.sidebar.slider("Refresh every (seconds)", 2, 30, 5)
-    need_name = iface_mode == "Choose interface" and not iface.strip()
     b1, b2 = st.sidebar.columns(2)
     if b1.button("Start", disabled=mon.running or need_name):
         try:
@@ -100,6 +118,11 @@ baseline_mode = st.sidebar.selectbox(
     "Baseline mode",
     ["mean_std", "median_mad"],
     format_func=lambda m: "Mean + Std" if m == "mean_std" else "Median + MAD (robust)",
+)
+bonferroni_adj = st.sidebar.checkbox(
+    "Bonferroni adjustment",
+    value=True,
+    help="Adjust significance threshold across multiple tested features to control false positive rate",
 )
 contamination = st.sidebar.slider("ML contamination", 0.01, 0.30, 0.10, 0.01)
 
@@ -177,10 +200,10 @@ if "label" in df.columns:
 df = df.reset_index(drop=True)
 
 # ---------------- Detection pipeline ----------------
-df["Statistical Result"], stat_threshold = detect_statistical_anomalies(
-    df, std_multiplier=std_multiplier, baseline_mode=baseline_mode
-)
 df = add_engineered_features(df)
+df["Statistical Result"], stat_threshold = detect_statistical_anomalies(
+    df, std_multiplier=std_multiplier, baseline_mode=baseline_mode, bonferroni=bonferroni_adj
+)
 
 eng_cols = ["packets_per_sec", "bytes_per_sec", "bytes_per_packet"]
 has_engineered = any(c in df.columns for c in eng_cols)
@@ -199,21 +222,52 @@ ml_with = (
 ml_results = ml_with if use_engineered else ml_without
 df["ML Result"] = ml_results["ml_status"].values
 
-df = add_explanations(df, threshold=std_multiplier, baseline_mode=baseline_mode)
+df = add_explanations(df, threshold=stat_threshold, baseline_mode=baseline_mode)
 df["Flag Status"] = df["Flagged By"].replace({"None": "Normal"})
 
-# Supervised ensemble (only for UNSW-format feature sets)
+if live:
+    mon.record_alerts(df[df["Flag Status"] != "Normal"])
+
+# Supervised ensemble (extended UNSW model or live/PCAP flow model)
 bundle = load_ensemble()
+flow_bundle = load_flow_ensemble()
 has_ens = False
-if bundle is not None:
+ens_title = "Supervised Ensemble"
+
+if bundle is not None and all(c in df.columns for c in bundle["spec"]["num_cols"] + bundle["spec"]["cat_cols"]):
     spec = bundle["spec"]
-    if all(c in df.columns for c in spec["num_cols"] + spec["cat_cols"]):
-        op = st.sidebar.selectbox("Supervised ensemble operating point", list(bundle["thresholds"]))
-        X_ens = transform_with_spec(df, spec)
-        score = (bundle["rf"].predict_proba(X_ens)[:, 1] + bundle["hgb"].predict_proba(X_ens)[:, 1]) / 2
-        df["Ensemble Score"] = score.round(4)
-        df["Ensemble Result"] = np.where(score > bundle["thresholds"][op], FLAG, "Normal")
-        has_ens = True
+    op = st.sidebar.selectbox("Supervised ensemble operating point", list(bundle["thresholds"]))
+    X_ens = transform_with_spec(df, spec)
+    score = (bundle["rf"].predict_proba(X_ens)[:, 1] + bundle["hgb"].predict_proba(X_ens)[:, 1]) / 2
+    df["Ensemble Score"] = score.round(4)
+    df["Ensemble Result"] = np.where(score > bundle["thresholds"][op], FLAG, "Normal")
+    has_ens = True
+    ens_title = "Supervised Ensemble (UNSW Extended)"
+elif flow_bundle is not None and all(c in df.columns for c in ["packets", "bytes", "duration"]):
+    op = st.sidebar.selectbox("Supervised flow model operating point", list(flow_bundle["thresholds"]))
+    proto = df["protocol"].astype(str).str.lower() if "protocol" in df.columns else pd.Series("tcp", index=df.index)
+    sport = pd.to_numeric(df["source_port"], errors="coerce").fillna(0) if "source_port" in df.columns else pd.Series(0, index=df.index)
+    dport = pd.to_numeric(df["dest_port"], errors="coerce").fillna(0) if "dest_port" in df.columns else pd.Series(0, index=df.index)
+
+    X_flow = pd.DataFrame({
+        "packets": pd.to_numeric(df["packets"], errors="coerce"),
+        "bytes": pd.to_numeric(df["bytes"], errors="coerce"),
+        "duration": pd.to_numeric(df["duration"], errors="coerce"),
+        "packets_per_sec": pd.to_numeric(df["packets_per_sec"], errors="coerce") if "packets_per_sec" in df.columns else 0.0,
+        "bytes_per_sec": pd.to_numeric(df["bytes_per_sec"], errors="coerce") if "bytes_per_sec" in df.columns else 0.0,
+        "bytes_per_packet": pd.to_numeric(df["bytes_per_packet"], errors="coerce") if "bytes_per_packet" in df.columns else 0.0,
+        "source_port": sport,
+        "dest_port": dport,
+        "proto_tcp": (proto == "tcp").astype(float),
+        "proto_udp": (proto == "udp").astype(float),
+    }).replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    X_flow = X_flow[flow_bundle["features"]]
+    score = (flow_bundle["rf"].predict_proba(X_flow)[:, 1] + flow_bundle["hgb"].predict_proba(X_flow)[:, 1]) / 2
+    df["Ensemble Score"] = score.round(4)
+    df["Ensemble Result"] = np.where(score > flow_bundle["thresholds"][op], FLAG, "Normal")
+    has_ens = True
+    ens_title = "Supervised Flow Model (Live/PCAP compatible)"
 
 # ---------------- Sidebar filters ----------------
 st.sidebar.header("Filters")
@@ -247,10 +301,19 @@ with tab_ov:
     c3.metric("Statistical Flags", f"{int(is_stat.sum()):,}")
     c4.metric("ML Flags", f"{int(is_ml.sum()):,}")
     c5.metric("Flagged by Both", f"{int((is_stat & is_ml).sum()):,}")
+    if hasattr(stat_threshold, "summary_text"):
+        thresh_info = stat_threshold.summary_text()
+    elif isinstance(stat_threshold, dict):
+        thresh_info = ", ".join(
+            f"{k}: {v:,.1f}" if v != float("inf") else f"{k}: none"
+            for k, v in stat_threshold.items()
+        )
+    else:
+        thresh_info = f"packets: {stat_threshold:,.2f}"
     st.caption(
-        f"Statistical threshold on packets: "
-        f"{'none (zero spread)' if stat_threshold == float('inf') else f'{stat_threshold:,.2f}'} "
-        f"({baseline_mode}, multiplier {std_multiplier})"
+        f"Statistical thresholds ({baseline_mode}, base multiplier {std_multiplier}"
+        f"{', Bonferroni-adjusted' if getattr(stat_threshold, 'bonferroni', False) else ''}): "
+        f"{thresh_info}"
     )
 
     left, right = st.columns([1, 2])
@@ -302,6 +365,21 @@ with tab_tr:
                         show(px.bar(data, x="protocol", y=col,
                                     color_discrete_sequence=[COLORS["Normal"]]), 260)
 
+    if live:
+        ts_df = mon.get_time_series()
+        if not ts_df.empty and len(ts_df) > 1:
+            st.divider()
+            st.subheader("📈 Live Traffic Temporal Trends")
+            tc1, tc2 = st.columns(2)
+            with tc1:
+                show(px.line(ts_df, x="time", y="packets_per_sec", markers=True,
+                             title="Packets/sec over time",
+                             color_discrete_sequence=[COLORS["Normal"]]), 280)
+            with tc2:
+                show(px.line(ts_df, x="time", y="bytes_per_sec", markers=True,
+                             title="Bytes/sec over time",
+                             color_discrete_sequence=[COLORS["Statistical"]]), 280)
+
 with tab_inv:
     st.subheader("Potential Anomalies")
     flagged = view[is_stat.loc[view.index] | is_ml.loc[view.index]]
@@ -323,6 +401,23 @@ with tab_inv:
         st.dataframe(flagged[show_cols], width="stretch")
         st.download_button("Download flagged records", flagged.to_csv(index=False).encode("utf-8"),
                            "flowwatch_flagged_records.csv", "text/csv")
+
+    if live:
+        st.divider()
+        st.subheader("🚨 Live Session Alert History Log")
+        alerts_df = mon.get_alert_log()
+        if not alerts_df.empty:
+            st.info(f"**{len(alerts_df):,} total alert(s)** recorded across this entire monitoring session.")
+            st.dataframe(alerts_df, width="stretch")
+            st.download_button(
+                "Download full session alert history",
+                alerts_df.to_csv(index=False).encode("utf-8"),
+                "flowwatch_session_alert_log.csv",
+                "text/csv",
+            )
+        else:
+            st.caption("No alerts logged in the session history yet.")
+
     st.caption("Flagged records are unusual patterns, not confirmed attacks. "
                "An empty reason means Isolation Forest flagged the record on a feature "
                "combination no single feature explains.")
@@ -344,12 +439,12 @@ with tab_cmp:
             "Records": [int((is_stat & is_ml).sum()), int((is_stat & ~is_ml).sum()),
                         int((~is_stat & is_ml).sum()), int((~is_stat & ~is_ml).sum())],
         }))
-    st.caption("The statistical method tests packet count only; Isolation Forest uses every "
-               "available numeric feature, so the two can legitimately disagree.")
+    st.caption("The statistical detector evaluates continuous flow features (packets, bytes, duration, and rates); "
+               "Isolation Forest uses all numeric features including ports to detect multivariate anomalies.")
 
     if has_ens:
         is_ens = df["Ensemble Result"] == FLAG
-        st.subheader("Supervised Ensemble (Random Forest + Gradient Boosting)")
+        st.subheader(ens_title)
         e1, e2, e3 = st.columns(3)
         e1.metric("Ensemble Flags", int(is_ens.sum()))
         e2.metric("Also flagged by Statistical or ML", int((is_ens & (is_stat | is_ml)).sum()))
@@ -375,11 +470,25 @@ with tab_cmp:
 
 with tab_eval:
     st.subheader("Model Evaluation (labelled data)")
+    eval_options = []
     if os.path.exists("evaluation_results.csv"):
-        res = pd.read_csv("evaluation_results.csv")
+        eval_options.append("UNSW-NB15")
+    if os.path.exists("evaluation_cic_results.csv"):
+        eval_options.append("CIC-IDS2017")
+
+    if eval_options:
+        chosen_dataset = st.radio("Benchmark Dataset", eval_options, horizontal=True)
+        if chosen_dataset == "CIC-IDS2017":
+            csv_path = "evaluation_cic_results.csv"
+            json_path = "evaluation_cic_results.json"
+        else:
+            csv_path = "evaluation_results.csv"
+            json_path = "evaluation_results.json"
+
+        res = pd.read_csv(csv_path)
         meta = {}
-        if os.path.exists("evaluation_results.json"):
-            with open("evaluation_results.json", encoding="utf-8") as f:
+        if os.path.exists(json_path):
+            with open(json_path, encoding="utf-8") as f:
                 meta = json.load(f)
         if meta.get("is_synthetic"):
             st.warning("These metrics come from a SYNTHETIC labelled dataset generated by "
@@ -430,10 +539,15 @@ with tab_eval:
             cat = cat.reset_index().rename(columns={"index": "category"})
             show(px.bar(cat, x="category", y="recall", range_y=[0, 1.02],
                         color_discrete_sequence=[COLORS["Normal"]]), 320)
-        st.caption("Supervised models only recognise attack types seen in training; Isolation "
-                   "Forest can flag novel behaviour. FlowWatch presents both as a hybrid. "
-                   "Test false-positive rates can exceed their targets because of the known "
-                   "UNSW-NB15 train/test distribution shift.")
+        shift_note = (
+            "Test false-positive rates can exceed their targets because of the known "
+            "UNSW-NB15 train/test distribution shift."
+            if chosen_dataset == "UNSW-NB15"
+            else "CIC-IDS2017 evaluation demonstrates cross-day generalization across multiple attack profiles."
+        )
+        st.caption(f"Supervised models only recognise attack types seen in training; Isolation "
+                   f"Forest can flag novel behaviour. FlowWatch presents both as a hybrid. "
+                   f"{shift_note}")
     else:
         st.info("evaluation_results.csv not found. Run: py -3.12 evaluation.py")
 

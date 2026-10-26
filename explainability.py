@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 
 
@@ -32,20 +33,26 @@ def compute_baseline_stats(df, columns=None, baseline_mode="mean_std"):
     if columns is None:
         exclude = {
             "protocol",
+            "source_port",
+            "dest_port",
+            "src_ip",
+            "dst_ip",
             "ml_result",
             "ml_status",
             "statistical_status",
             "statistical result",
+            "statistical features",
             "ml result",
             "flagged by",
             "reasons",
             "flagged_by",
+            "label",
+            "attack_cat",
         }
         candidates = [
             "packets",
             "bytes",
             "duration",
-            "source_port",
             "packets_per_sec",
             "bytes_per_sec",
             "bytes_per_packet",
@@ -64,7 +71,7 @@ def compute_baseline_stats(df, columns=None, baseline_mode="mean_std"):
     for col in columns:
         if col not in df.columns:
             continue
-        series = pd.to_numeric(df[col], errors="coerce").dropna()
+        series = pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
         if series.empty:
             continue
 
@@ -94,8 +101,18 @@ def find_deviations(record, baseline_stats, threshold=2.0):
     For a single record (dict-like or pandas Series), finds which features deviate
     from the baseline (z-score magnitude >= threshold, default 2.0) and in which
     direction ('high' or 'low').
+
+    Supports scalar threshold multipliers, ThresholdResult objects, or feature-specific
+    threshold dictionaries.
     """
     deviations = []
+    thresh_multiplier = getattr(threshold, "effective_multiplier", None)
+    if thresh_multiplier is None:
+        try:
+            thresh_multiplier = float(threshold)
+        except (TypeError, ValueError):
+            thresh_multiplier = 2.0
+
     for feature, stats in baseline_stats.items():
         if feature not in record:
             continue
@@ -104,7 +121,7 @@ def find_deviations(record, baseline_stats, threshold=2.0):
             val_num = float(val)
         except (ValueError, TypeError):
             continue
-        if pd.isna(val_num):
+        if pd.isna(val_num) or (hasattr(np, "isinf") and np.isinf(val_num)):
             continue
 
         mean = stats["mean"]
@@ -113,7 +130,16 @@ def find_deviations(record, baseline_stats, threshold=2.0):
             continue
 
         z_score = (val_num - mean) / std
-        if abs(z_score) >= threshold:
+
+        is_dev = False
+        if isinstance(threshold, dict) and feature in threshold:
+            t_val = threshold[feature]
+            if t_val != float("inf") and val_num > t_val:
+                is_dev = True
+        if not is_dev and abs(z_score) >= thresh_multiplier:
+            is_dev = True
+
+        if is_dev:
             direction = "high" if z_score > 0 else "low"
             deviations.append({
                 "feature": feature,
