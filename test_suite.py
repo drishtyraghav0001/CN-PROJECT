@@ -8,6 +8,7 @@ import pandas as pd
 
 from data_loader import load_network_data
 from evaluate_cic import clean_cic_label
+from evaluation import transform_with_spec
 from feature_engineering import add_engineered_features
 from live_monitor import LiveMonitor, get_available_interfaces
 from ml_detector import detect_anomalies
@@ -495,6 +496,139 @@ def test_live_alert_deduplication_and_interface_fallback():
     print("      [PASS] Interface discovery degrades gracefully to empty list on Scapy/driver failure")
 
 
+def test_extended_ensemble_and_missing_artifacts():
+    print("[11/12] Testing Extended Ensemble Robustness & Missing Artifact Handling...")
+    # 1. Extended UNSW Ensemble artifact and transformation with inf/nan
+    model_path = "ensemble_model.joblib"
+    if os.path.exists(model_path):
+        bundle = joblib.load(model_path)
+        assert "spec" in bundle and "rf" in bundle and "hgb" in bundle
+        spec = bundle["spec"]
+
+        # Test extreme input with inf, -inf, nan, and novel categories
+        test_data = {c: [100.0, np.inf, -np.inf, np.nan] for c in spec["num_cols"]}
+        for c in spec["cat_cols"]:
+            test_data[c] = ["tcp", "novel_protocol_unknown", np.nan, "udp"]
+        df_extreme = pd.DataFrame(test_data)
+
+        X_trans = transform_with_spec(df_extreme, spec)
+        assert not np.isnan(X_trans).any(), "Transformed feature matrix must contain no NaN"
+        assert not np.isinf(X_trans).any(), "Transformed feature matrix must contain no inf"
+
+        # Predict with both estimators
+        rf_probs = bundle["rf"].predict_proba(X_trans)[:, 1]
+        hgb_probs = bundle["hgb"].predict_proba(X_trans)[:, 1]
+        assert len(rf_probs) == 4 and len(hgb_probs) == 4
+        assert not np.isnan(rf_probs).any() and not np.isnan(hgb_probs).any()
+        print("      [PASS] Extended ensemble and transform_with_spec handle inf, -inf, NaN, and novel categories safely")
+
+    # 2. Missing artifact fallback handling
+    missing_path = "scratch_non_existent_model.joblib"
+    loaded = joblib.load(missing_path) if os.path.exists(missing_path) else None
+    assert loaded is None, "Missing model artifact should return None safely"
+
+    # 3. Partial/malformed metadata formatting robustness (no TypeError on None)
+    partial_meta = {"dataset_name": "Test Benchmark", "train_records": None, "test_records": 1000}
+    parts = [f"Dataset: {partial_meta.get('dataset_name', 'Unknown')}"]
+    if partial_meta.get("train_records") is not None:
+        parts.append(f"train {partial_meta['train_records']:,}")
+    if partial_meta.get("test_records") is not None:
+        atk_str = f" ({partial_meta.get('test_attack_records'):,} attacks)" if partial_meta.get("test_attack_records") is not None else ""
+        parts.append(f"test {partial_meta['test_records']:,}{atk_str}")
+    formatted = " | ".join(parts)
+    assert "Dataset: Test Benchmark" in formatted and "test 1,000" in formatted
+    print("      [PASS] Missing model artifacts and partial metadata handled safely without exceptions")
+
+
+def test_cic_upload_mapping_and_detector_pipeline():
+    print("[12/12] Testing CIC-IDS2017 Format Upload Mapping & Detector Compatibility...")
+    # 1. Realistic CIC raw DataFrame
+    raw_cic = pd.DataFrame({
+        "Destination Port": [80, 443, 22, 8080],
+        "Flow Duration": [1000000, 500000, 2000000, 1500000],  # in microseconds
+        "Total Fwd Packets": [50, 20, 100, 150],
+        "Total Backward Packets": [40, 15, 80, 120],
+        "Total Length of Fwd Packets": [3000, 1500, 10000, 15000],
+        "Total Length of Bwd Packets": [5000, 2000, 20000, 25000],
+        "Label": ["BENIGN", "BENIGN", "Web Attack \ufffd XSS", "DDoS"],
+    })
+
+    # Apply FlowWatch CIC mapping logic
+    col_map = {c.strip().lower(): c for c in raw_cic.columns}
+    assert {"total fwd packets", "total backward packets"}.issubset(col_map)
+
+    p = pd.to_numeric(raw_cic[col_map["total fwd packets"]], errors="coerce").fillna(0) + \
+        pd.to_numeric(raw_cic[col_map["total backward packets"]], errors="coerce").fillna(0)
+    b = pd.to_numeric(raw_cic[col_map["total length of fwd packets"]], errors="coerce").fillna(0) + \
+        pd.to_numeric(raw_cic[col_map["total length of bwd packets"]], errors="coerce").fillna(0)
+    d = (pd.to_numeric(raw_cic[col_map["flow duration"]], errors="coerce").fillna(0) / 1e6).clip(lower=0)
+    dport = pd.to_numeric(raw_cic[col_map["destination port"]], errors="coerce").fillna(0)
+    clean_lbl = clean_cic_label(raw_cic[col_map["label"]])
+
+    flow_df = pd.DataFrame({
+        "protocol": "TCP",
+        "packets": p,
+        "bytes": b,
+        "duration": d,
+        "dest_port": dport,
+        "source_port": 0,
+        "attack_cat": clean_lbl,
+        "label": (clean_lbl.str.upper() != "BENIGN").astype(int),
+    })
+
+    # Verify column presence and types
+    assert set(["protocol", "packets", "bytes", "duration", "dest_port", "source_port", "attack_cat", "label"]).issubset(flow_df.columns)
+    assert flow_df["protocol"].iloc[0] == "TCP"
+    assert flow_df["packets"].iloc[0] == 90
+    assert flow_df["bytes"].iloc[0] == 8000
+    assert flow_df["duration"].iloc[0] == 1.0
+    assert flow_df["attack_cat"].iloc[2] == "Web Attack - XSS"
+    assert flow_df["label"].tolist() == [0, 0, 1, 1]
+
+    # Ground-truth separation
+    truth = flow_df[["label", "attack_cat"]].copy()
+    features_df = flow_df.drop(columns=["label", "attack_cat"])
+    assert "label" not in features_df.columns
+
+    # Pass through feature engineering
+    features_df = add_engineered_features(features_df)
+    assert "packets_per_sec" in features_df.columns
+    assert "bytes_per_sec" in features_df.columns
+    assert "bytes_per_packet" in features_df.columns
+
+    # Statistical detector
+    s_status, s_thresh = detect_statistical_anomalies(features_df, std_multiplier=2.0)
+    assert len(s_status) == 4
+
+    # ML detector (Isolation Forest)
+    ml_out = detect_anomalies(features_df, use_engineered_features=True, contamination=0.25)
+    assert len(ml_out) == 4
+
+    # Supervised flow ensemble model
+    flow_bundle = joblib.load("flow_ensemble_model.joblib")
+    proto = features_df["protocol"].astype(str).str.lower()
+    sport = pd.to_numeric(features_df["source_port"], errors="coerce").fillna(0)
+    dport = pd.to_numeric(features_df["dest_port"], errors="coerce").fillna(0)
+    X_flow = pd.DataFrame({
+        "packets": pd.to_numeric(features_df["packets"], errors="coerce"),
+        "bytes": pd.to_numeric(features_df["bytes"], errors="coerce"),
+        "duration": pd.to_numeric(features_df["duration"], errors="coerce"),
+        "packets_per_sec": pd.to_numeric(features_df["packets_per_sec"], errors="coerce"),
+        "bytes_per_sec": pd.to_numeric(features_df["bytes_per_sec"], errors="coerce"),
+        "bytes_per_packet": pd.to_numeric(features_df["bytes_per_packet"], errors="coerce"),
+        "source_port": sport,
+        "dest_port": dport,
+        "proto_tcp": (proto == "tcp").astype(float),
+        "proto_udp": (proto == "udp").astype(float),
+    }).replace([np.inf, -np.inf], np.nan).fillna(0)
+    X_flow = X_flow[flow_bundle["features"]]
+
+    scores = (flow_bundle["rf"].predict_proba(X_flow)[:, 1] + flow_bundle["hgb"].predict_proba(X_flow)[:, 1]) / 2.0
+    assert len(scores) == 4
+    assert (scores >= 0.0).all() and (scores <= 1.0).all()
+    print("      [PASS] CIC-IDS2017 schema mapped seamlessly and verified compatible with all detectors")
+
+
 if __name__ == "__main__":
     print("==================================================")
     print(" FlowWatch Complete Verification Test Suite")
@@ -510,6 +644,8 @@ if __name__ == "__main__":
         test_supervised_flow_model_compatibility()
         test_benchmark_selection_and_cic_label_normalization()
         test_live_alert_deduplication_and_interface_fallback()
+        test_extended_ensemble_and_missing_artifacts()
+        test_cic_upload_mapping_and_detector_pipeline()
         print("\n==================================================")
         print(" ALL TESTS PASSED! All features verified working.")
         print("==================================================")

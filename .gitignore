@@ -9,3 +9,9 @@ data/*.csv
 data/cic/
 cic_sample.csv
 __pycache__/
+
+# Runtime SQLite database and sidecars
+flowwatch.db
+flowwatch.db-wal
+flowwatch.db-shm
+*.db-journal

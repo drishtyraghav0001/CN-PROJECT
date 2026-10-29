@@ -476,18 +476,18 @@ def build_feature_spec(train_feat, train_labels, top_k=8):
     num_cols = [c for c in base + EXTRA_NUMERIC if c in train_feat.columns]
     cat_cols = [c for c in ["protocol"] + EXTRA_CATEGORICAL if c in train_feat.columns]
     normal = np.asarray(train_labels) == 0
-    x = train_feat[num_cols].apply(pd.to_numeric, errors="coerce")
+    x = train_feat[num_cols].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
     med = (np.sign(x) * np.log1p(x.abs()))[normal].median().fillna(0)
     tops = {c: train_feat.loc[normal, c].value_counts().head(top_k).index.tolist() for c in cat_cols}
     return {"num_cols": num_cols, "cat_cols": cat_cols, "med": med, "tops": tops}
 
 
 def transform_with_spec(df, spec):
-    x = df[spec["num_cols"]].apply(pd.to_numeric, errors="coerce")
+    x = df[spec["num_cols"]].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
     num = (np.sign(x) * np.log1p(x.abs())).fillna(spec["med"]).fillna(0).values
     parts = [num]
     for c in spec["cat_cols"]:
-        s = df[c].astype(str)
+        s = df[c].astype(str) if c in df.columns else pd.Series("other", index=df.index)
         s = s.where(s.isin(spec["tops"][c]), "other")
         parts.append(pd.get_dummies(pd.Categorical(s, categories=spec["tops"][c] + ["other"])).values.astype(float))
     return np.hstack(parts)

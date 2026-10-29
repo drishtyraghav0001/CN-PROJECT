@@ -17,6 +17,18 @@ from pcap_loader import load_pcap_data
 from statistical_detector import detect_statistical_anomalies
 from live_monitor import LiveMonitor, get_available_interfaces
 from evaluation import inspect_and_load_unsw, transform_with_spec
+from evaluate_cic import clean_cic_label
+from incident_models import (
+    ActionMode,
+    ActionStatus,
+    ActionType,
+    AlertSeverity,
+    IncidentStatus,
+    VALID_INCIDENT_TRANSITIONS,
+)
+from incident_store import IncidentStore
+from incident_engine import IncidentEngine, extract_alerts_from_dataframe
+from response_engine import ResponseEngine
 
 st.set_page_config(page_title="FlowWatch", page_icon="🛡️", layout="wide")
 
@@ -52,6 +64,22 @@ def load_ensemble(path="ensemble_model.joblib"):
 @st.cache_resource
 def load_flow_ensemble(path="flow_ensemble_model.joblib"):
     return joblib.load(path) if os.path.exists(path) else None
+
+
+@st.cache_resource
+def get_incident_store(db_path: str = "flowwatch.db") -> IncidentStore:
+    return IncidentStore(db_path)
+
+
+@st.cache_resource
+def get_response_engine(db_path: str = "flowwatch.db") -> ResponseEngine:
+    store = get_incident_store(db_path)
+    return ResponseEngine(store)
+
+
+@st.cache_resource
+def get_incident_engine() -> IncidentEngine:
+    return IncidentEngine(time_window_seconds=300)
 
 
 def auto_refresh(seconds):
@@ -143,7 +171,8 @@ if uploaded_file is not None:
             )
         elif fname.endswith(".csv"):
             df = pd.read_csv(uploaded_file)
-            if {"proto", "spkts", "dpkts"}.issubset(c.strip().lower() for c in df.columns):
+            col_map = {c.strip().lower(): c for c in df.columns}
+            if {"proto", "spkts", "dpkts"}.issubset(col_map):
                 with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w", newline="") as tmp:
                     df.to_csv(tmp, index=False)
                 df = inspect_and_load_unsw(tmp.name)
@@ -153,6 +182,43 @@ if uploaded_file is not None:
                     st.info("UNSW-format file detected: random sample of 20,000 records analysed for speed.")
                 else:
                     st.info("UNSW-format file detected and mapped to the FlowWatch schema.")
+            elif {"total fwd packets", "total backward packets"}.issubset(col_map):
+                p = (
+                    pd.to_numeric(df[col_map["total fwd packets"]], errors="coerce").fillna(0)
+                    + pd.to_numeric(df[col_map["total backward packets"]], errors="coerce").fillna(0)
+                )
+                b = 0
+                if "total length of fwd packets" in col_map and "total length of bwd packets" in col_map:
+                    b = (
+                        pd.to_numeric(df[col_map["total length of fwd packets"]], errors="coerce").fillna(0)
+                        + pd.to_numeric(df[col_map["total length of bwd packets"]], errors="coerce").fillna(0)
+                    )
+                d = 0.0
+                if "flow duration" in col_map:
+                    d = (pd.to_numeric(df[col_map["flow duration"]], errors="coerce").fillna(0) / 1e6).clip(lower=0)
+                dport = (
+                    pd.to_numeric(df[col_map["destination port"]], errors="coerce").fillna(0)
+                    if "destination port" in col_map else 0
+                )
+                clean_lbl = clean_cic_label(df[col_map["label"]]) if "label" in col_map else None
+
+                df = pd.DataFrame({
+                    "protocol": "TCP",
+                    "packets": p,
+                    "bytes": b,
+                    "duration": d,
+                    "dest_port": dport,
+                    "source_port": 0,
+                })
+                if clean_lbl is not None:
+                    df["attack_cat"] = clean_lbl
+                    df["label"] = (clean_lbl.str.upper() != "BENIGN").astype(int)
+
+                if len(df) > 20000:
+                    df = df.sample(20000, random_state=42)
+                    st.info("CIC-IDS2017-format file detected: random sample of 20,000 records analysed for speed.")
+                else:
+                    st.info("CIC-IDS2017-format file detected and mapped to the FlowWatch schema.")
         else:
             df = pd.read_json(uploaded_file)
 
@@ -273,6 +339,10 @@ elif flow_bundle is not None and all(c in df.columns for c in ["packets", "bytes
 st.sidebar.header("Filters")
 protocols = sorted(df["protocol"].unique())
 sel_protocols = st.sidebar.multiselect("Protocol", protocols, default=protocols)
+if not sel_protocols:
+    st.sidebar.warning("Please select at least one protocol.")
+    st.warning("No protocols selected. Please select at least one protocol from the sidebar filter.")
+    st.stop()
 flag_filter = st.sidebar.selectbox(
     "Flagged by", ["All flagged", "Statistical only", "ML only", "Both"]
 )
@@ -287,10 +357,32 @@ is_ml = df["ML Result"] == FLAG
 view = df[df["protocol"].isin(sel_protocols)]
 flagged_pct = 100 * int((is_stat | is_ml).sum()) / len(df)
 
+# ---------------- Incident Engine Ingestion ----------------
+inc_store = get_incident_store()
+inc_engine = get_incident_engine()
+resp_engine = get_response_engine()
+
+# Automatically ingest flagged traffic into incidents without duplicate creation
+try:
+    if "Flag Status" in df.columns and (df["Flag Status"] != "Normal").any():
+        stype = "live" if live else ("pcap" if source_label.lower().endswith((".pcap", ".pcapng")) else "file")
+        extracted_alerts = extract_alerts_from_dataframe(df, source_type=stype)
+        if extracted_alerts:
+            inc_engine.process_and_persist(extracted_alerts, inc_store, skip_already_associated=True)
+except Exception as ing_err:
+    pass
+
 # ---------------- Tabs ----------------
-tab_ov, tab_tr, tab_inv, tab_cmp, tab_eval, tab_rep = st.tabs(
-    ["Overview", "Traffic Analytics", "Anomaly Investigation",
-     "Model Comparison", "Evaluation", "Reports"]
+tab_ov, tab_tr, tab_inv, tab_cmp, tab_eval, tab_rep, tab_resp = st.tabs(
+    [
+        "Overview",
+        "Traffic Analytics",
+        "Anomaly Investigation",
+        "Model Comparison",
+        "Evaluation",
+        "Reports",
+        "Incident Response & Triage",
+    ]
 )
 
 with tab_ov:
@@ -339,12 +431,15 @@ with tab_tr:
         flagged_pts = plot[plot["Flag Status"] != "Normal"]
         normal_pts = plot[plot["Flag Status"] == "Normal"]
         plot = pd.concat([flagged_pts, normal_pts.sample(min(len(normal_pts), 3000), random_state=1)])
-        fig = px.scatter(plot, x="packets", y="bytes", color="Flag Status",
-                         color_discrete_map=COLORS, category_orders={"Flag Status": ORDER},
-                         hover_data=[c for c in ["protocol", "duration"] if c in plot.columns],
-                         log_x=True, log_y=True, opacity=0.7)
-        show(fig, 420)
-        st.caption("Log scales. Up to 3,000 normal records are drawn for speed; all flagged records are shown.")
+        if not plot.empty:
+            fig = px.scatter(plot, x="packets", y="bytes", color="Flag Status",
+                             color_discrete_map=COLORS, category_orders={"Flag Status": ORDER},
+                             hover_data=[c for c in ["protocol", "duration"] if c in plot.columns],
+                             log_x=True, log_y=True, opacity=0.7)
+            show(fig, 420)
+            st.caption("Log scales. Up to 3,000 normal records are drawn for speed; all flagged records are shown.")
+        else:
+            st.info("No records with positive packet and byte counts to display.")
     else:
         show(px.histogram(view, x="packets", color="Flag Status", color_discrete_map=COLORS, nbins=40))
 
@@ -495,8 +590,14 @@ with tab_eval:
                        "evaluation.py. They demonstrate the evaluation method and are not "
                        "evidence of real-world detection performance.")
         if meta:
-            st.caption(f"Dataset: {meta.get('dataset_name')} | train {meta.get('train_records'):,} | "
-                       f"test {meta.get('test_records'):,} ({meta.get('test_attack_records'):,} attacks)")
+            ds_name = meta.get("dataset_name", chosen_dataset)
+            parts = [f"Dataset: {ds_name}"]
+            if meta.get("train_records") is not None:
+                parts.append(f"train {meta['train_records']:,}")
+            if meta.get("test_records") is not None:
+                atk_str = f" ({meta.get('test_attack_records'):,} attacks)" if meta.get("test_attack_records") is not None else ""
+                parts.append(f"test {meta['test_records']:,}{atk_str}")
+            st.caption(" | ".join(parts))
 
         st.dataframe(res.drop(columns=["Dataset"], errors="ignore"), width="stretch")
 
@@ -513,8 +614,12 @@ with tab_eval:
         st.caption("Top-right is better. Each dot is one method or operating point.")
 
         st.subheader("Compare selected methods")
-        default = [m for m in ["Statistical Detector (Mean + Std)", "Isolation Forest (Semi-Supervised)",
-                               meta.get("best_method")] if m in set(res["Method"])]
+        default_candidates = [
+            "Statistical Detector (Mean + Std)",
+            "Isolation Forest (Semi-Supervised)",
+            meta.get("best_method"),
+        ]
+        default = [m for m in dict.fromkeys(default_candidates) if m and m in set(res["Method"])]
         chosen = st.multiselect("Methods", res["Method"].tolist(), default=default)
         if chosen:
             long = res[res["Method"].isin(chosen)].melt(
@@ -537,8 +642,9 @@ with tab_eval:
                                 index=names.index(meta["best_method"]) if meta.get("best_method") in names else 0)
             cat = pd.DataFrame(sup_methods[pick]["per_category_recall"]).T.astype(float)
             cat = cat.reset_index().rename(columns={"index": "category"})
-            show(px.bar(cat, x="category", y="recall", range_y=[0, 1.02],
-                        color_discrete_sequence=[COLORS["Normal"]]), 320)
+            if not cat.empty:
+                show(px.bar(cat, x="category", y="recall", range_y=[0, 1.02],
+                            color_discrete_sequence=[COLORS["Normal"]]), 320)
         shift_note = (
             "Test false-positive rates can exceed their targets because of the known "
             "UNSW-NB15 train/test distribution shift."
@@ -558,6 +664,344 @@ with tab_rep:
     st.info("An anomaly is an unusual pattern, not proof of an attack. "
             "FlowWatch is a prototype for demonstration and learning. "
             "Only monitor traffic you are authorized to capture.")
+
+# ---------------- Tab 7: Incident Response & Triage ----------------
+with tab_resp:
+    st.subheader("🛡️ Incident Response & Simulated Triage")
+    st.caption("Review correlated network security incidents, manage approval workflows, execute safe simulated containment playbooks, and inspect audit logs.")
+
+    # --- Section A: Incident Overview & Summary Metrics ---
+    all_incidents = inc_store.list_incidents(limit=300)
+    total_incs = len(all_incidents)
+    active_incs = sum(1 for i in all_incidents if i.status in (IncidentStatus.NEW, IncidentStatus.INVESTIGATING))
+    high_risk_incs = sum(1 for i in all_incidents if i.severity in (AlertSeverity.HIGH, AlertSeverity.CRITICAL) or i.risk_score >= 70)
+    contained_incs = sum(1 for i in all_incidents if i.status == IncidentStatus.CONTAINED)
+    all_actions = inc_store.get_response_actions()
+    pending_approvals = sum(1 for a in all_actions if a.status == ActionStatus.PENDING)
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Total Incidents", f"{total_incs:,}")
+    m2.metric("Active Incidents", f"{active_incs:,}")
+    m3.metric("High / Critical Risk", f"{high_risk_incs:,}")
+    m4.metric("Simulated Containments", f"{contained_incs:,}")
+    m5.metric("Pending Approvals", f"{pending_approvals:,}")
+
+    if total_incs == 0:
+        st.info("ℹ️ No network incidents currently recorded in the persistent database. Ingest traffic data or start live monitoring with flagged anomalies to trigger incident correlation.")
+    else:
+        # --- Section B: Incident List and Filters ---
+        st.markdown("---")
+        st.subheader("Incident Queue")
+        f1, f2, f3 = st.columns(3)
+        with f1:
+            status_opts = ["All"] + [s.value for s in IncidentStatus]
+            f_status = st.selectbox("Status Filter", status_opts, key="resp_filter_status")
+        with f2:
+            sev_opts = ["All"] + [s.value for s in AlertSeverity]
+            f_sev = st.selectbox("Severity Filter", sev_opts, key="resp_filter_severity")
+        with f3:
+            risk_opts = ["All", "Critical (>= 80)", "High (60-79)", "Medium (40-59)", "Low (< 40)"]
+            f_risk = st.selectbox("Risk Level Filter", risk_opts, key="resp_filter_risk")
+
+        filtered_incs = all_incidents
+        if f_status != "All":
+            filtered_incs = [i for i in filtered_incs if i.status.value == f_status]
+        if f_sev != "All":
+            filtered_incs = [i for i in filtered_incs if i.severity.value == f_sev]
+        if f_risk != "All":
+            if "Critical" in f_risk:
+                filtered_incs = [i for i in filtered_incs if i.risk_score >= 80]
+            elif "High" in f_risk:
+                filtered_incs = [i for i in filtered_incs if 60 <= i.risk_score < 80]
+            elif "Medium" in f_risk:
+                filtered_incs = [i for i in filtered_incs if 40 <= i.risk_score < 60]
+            elif "Low" in f_risk:
+                filtered_incs = [i for i in filtered_incs if i.risk_score < 40]
+
+        if not filtered_incs:
+            st.warning("No incidents match the active filter criteria.")
+        else:
+            inc_rows = []
+            for i in filtered_incs:
+                inc_rows.append({
+                    "Incident ID": i.incident_id[:8] + "...",
+                    "Created": i.created_at[:19].replace("T", " ") if i.created_at else "—",
+                    "Title": i.title,
+                    "Status": i.status.value,
+                    "Severity": i.severity.value,
+                    "Risk Score": f"{i.risk_score}/100",
+                    "Rule": i.correlation_rule,
+                    "Primary Entity": i.primary_entity or "—",
+                    "Alerts": len(i.alert_ids),
+                })
+            st.dataframe(pd.DataFrame(inc_rows), width="stretch")
+
+            inc_selection_map = {
+                i.incident_id: f"[{i.severity.value}] {i.title} (Risk: {i.risk_score}/100, Status: {i.status.value}) — ID: {i.incident_id[:8]}"
+                for i in filtered_incs
+            }
+            prev_sel = st.session_state.get("selected_incident_id")
+            opt_keys = list(inc_selection_map.keys())
+            def_idx = opt_keys.index(prev_sel) if prev_sel in opt_keys else 0
+
+            sel_inc_id = st.selectbox(
+                "Select an incident to investigate and respond:",
+                opt_keys,
+                index=def_idx,
+                format_func=lambda k: inc_selection_map[k],
+                key="resp_selected_inc_id",
+            )
+            st.session_state["selected_incident_id"] = sel_inc_id
+
+            if sel_inc_id:
+                sel_inc = inc_store.get_incident(sel_inc_id)
+                if sel_inc:
+                    # --- Section C: Incident Detail & Investigation ---
+                    st.markdown("---")
+                    st.subheader(f"Incident Investigation: {sel_inc.title}")
+
+                    c_det1, c_det2, c_det3, c_det4 = st.columns(4)
+                    c_det1.metric("Status", sel_inc.status.value)
+                    c_det2.metric("Severity", sel_inc.severity.value)
+                    c_det3.metric("Risk Score", f"{sel_inc.risk_score}/100")
+                    c_det4.metric("Rule", sel_inc.correlation_rule)
+
+                    st.progress(sel_inc.risk_score / 100.0)
+
+                    with st.expander("📊 Explainable Risk Scoring & Individual Factors", expanded=True):
+                        st.caption("Heuristic risk prioritization index (0-100), not an attack probability.")
+                        for rf in sel_inc.risk_factors:
+                            st.markdown(f"- {rf}")
+
+                    with st.expander("🔍 Observed Network Metadata & Summary", expanded=True):
+                        st.write(f"**Primary Entity**: `{sel_inc.primary_entity or 'Network'}` (Type: `{sel_inc.entity_type or 'unspecified'}`)")
+                        if sel_inc.summary:
+                            st.write(f"**Correlation Rationale**: {sel_inc.summary}")
+                        st.write(f"**Created At**: `{sel_inc.created_at}` | **Updated At**: `{sel_inc.updated_at}`")
+
+                    # Associated alerts table
+                    with st.expander(f"🚨 Associated Alerts ({len(sel_inc.alert_ids)} alerts)", expanded=False):
+                        inc_alerts = inc_store.get_alerts_for_incident(sel_inc.incident_id)
+                        if inc_alerts:
+                            alert_rows = []
+                            for a in inc_alerts:
+                                alert_rows.append({
+                                    "Alert ID": a.alert_id[:8] + "...",
+                                    "Timestamp": a.timestamp[:19].replace("T", " ") if a.timestamp else "—",
+                                    "Source IP": a.src_ip or "—",
+                                    "Dest IP": a.dst_ip or "—",
+                                    "Src Port": str(a.source_port) if a.source_port else "—",
+                                    "Dest Port": str(a.dest_port) if a.dest_port else "—",
+                                    "Proto": a.protocol,
+                                    "Packets": f"{a.packets:,}",
+                                    "Bytes": f"{a.bytes:,}" if a.bytes is not None else "—",
+                                    "Flagged By": a.flagged_by,
+                                    "Severity": a.severity.value,
+                                    "Reasons": a.reasons or "—",
+                                })
+                            st.dataframe(pd.DataFrame(alert_rows), width="stretch")
+                        else:
+                            st.caption("No alerts directly linked in database.")
+
+                    # --- Section D: Response Playbooks ---
+                    st.markdown("---")
+                    st.subheader("🛡️ Response Playbooks")
+                    playbook_analysis = resp_engine.explain_playbook_availability(sel_inc)
+
+                    pb_col1, pb_col2 = st.columns([2, 1])
+                    with pb_col1:
+                        st.write("**Confirmed Targets in Evidence**:")
+                        ip_text = ", ".join(f"`{ip}`" for ip in playbook_analysis["source_ips"]) if playbook_analysis["source_ips"] else "*None (No source IP)*"
+                        port_text = ", ".join(f"`{p}`" for p in playbook_analysis["destination_ports"]) if playbook_analysis["destination_ports"] else "*None (No destination port)*"
+                        st.write(f"- Source IPs: {ip_text}")
+                        st.write(f"- Destination Ports: {port_text}")
+
+                        if playbook_analysis["unavailable_reasons"]:
+                            with st.expander("ℹ️ Playbook Limitations & Unavailable Actions"):
+                                for ur in playbook_analysis["unavailable_reasons"]:
+                                    st.write(f"- {ur}")
+
+                    with pb_col2:
+                        if st.button("Generate Recommended Proposals", key=f"gen_prop_{sel_inc.incident_id}"):
+                            new_props = resp_engine.propose_actions(sel_inc.incident_id, auto_save=True, actor="ANALYST")
+                            st.success(f"Generated {len(new_props)} response proposal(s).")
+                            st.rerun()
+
+                    # Custom proposal creation
+                    with st.expander("➕ Propose Custom Action"):
+                        with st.form(f"custom_prop_form_{sel_inc.incident_id}"):
+                            avail_types = [ActionType(pt) for pt in playbook_analysis["available_playbooks"] if pt in [m.value for m in ActionType]]
+                            custom_type = st.selectbox("Action Type", avail_types, format_func=lambda t: t.value)
+                            default_target = ""
+                            if custom_type in (ActionType.SIMULATE_BLOCK_SOURCE, ActionType.WATCH_SOURCE) and playbook_analysis["source_ips"]:
+                                default_target = playbook_analysis["source_ips"][0]
+                            elif custom_type in (ActionType.SIMULATE_BLOCK_DESTINATION_PORT, ActionType.SIMULATED_BLOCK_PORT) and playbook_analysis["destination_ports"]:
+                                default_target = str(playbook_analysis["destination_ports"][0])
+                            elif custom_type == ActionType.MARK_FOR_INVESTIGATION:
+                                default_target = sel_inc.incident_id
+
+                            custom_target = st.text_input("Target Entity (IP / Port / ID)", value=default_target)
+                            custom_desc = st.text_input("Description (optional)", value=f"Custom {custom_type.value} on {custom_target}")
+                            sub_custom = st.form_submit_button("Submit Proposal")
+                            if sub_custom:
+                                try:
+                                    resp_engine.create_proposal(
+                                        sel_inc.incident_id,
+                                        custom_type,
+                                        target_entity=custom_target,
+                                        description=custom_desc,
+                                        actor="ANALYST",
+                                    )
+                                    st.success("Custom proposal submitted in PENDING state.")
+                                    st.rerun()
+                                except Exception as prop_err:
+                                    st.error(f"Proposal creation error: {prop_err}")
+
+                    # --- Section E & F: Action Approval, Execution, Verification, and Rollback ---
+                    st.markdown("---")
+                    st.subheader("📋 Response Action Workflow")
+                    inc_actions = inc_store.get_response_actions(incident_id=sel_inc.incident_id)
+
+                    if not inc_actions:
+                        st.info("No response actions currently proposed for this incident. Click 'Generate Recommended Proposals' above to begin.")
+                    else:
+                        for act in inc_actions:
+                            with st.container():
+                                st.markdown(f"#### `{act.action_type.value}` on `{act.target_entity}`")
+                                a_col1, a_col2, a_col3 = st.columns([2, 1, 1])
+                                with a_col1:
+                                    st.write(f"**Action ID**: `{act.action_id[:8]}...` | **Mode**: `{act.mode.value}`")
+                                    st.write(f"**Description**: {act.description}")
+                                    if act.execution_log:
+                                        st.caption(f"**Log**: {act.execution_log}")
+                                with a_col2:
+                                    st.write(f"**Status**: `{act.status.value}`")
+                                    if act.approver:
+                                        st.caption(f"Approved by: `{act.approver}` at {act.approved_at[:19] if act.approved_at else ''}")
+                                    if act.rejection_reason:
+                                        st.caption(f"Rejection Reason: {act.rejection_reason}")
+                                with a_col3:
+                                    if act.verification_status:
+                                        v_color = "🟢" if act.verification_status == "VERIFIED" else ("🔴" if act.verification_status == "FAILED" else "⚪")
+                                        st.write(f"**Verification**: {v_color} `{act.verification_status}`")
+                                    if act.executed_at:
+                                        st.caption(f"Executed: {act.executed_at[:19].replace('T', ' ')}")
+
+                                # Approval controls for PENDING
+                                if act.status == ActionStatus.PENDING:
+                                    st.info("✋ **Approval Required**: This action cannot execute until explicitly approved.")
+                                    appr_col1, appr_col2 = st.columns(2)
+                                    with appr_col1:
+                                        appr_note = st.text_input("Approval Comment (optional)", key=f"appr_note_{act.action_id}")
+                                        if st.button("✅ Approve Action", key=f"btn_appr_{act.action_id}"):
+                                            try:
+                                                resp_engine.approve_action(act.action_id, actor="ANALYST", comment=appr_note)
+                                                st.success("Action approved. Ready for simulated execution.")
+                                                st.rerun()
+                                            except Exception as a_err:
+                                                st.error(f"Approval error: {a_err}")
+                                    with appr_col2:
+                                        rej_reason = st.text_input("Rejection Reason", key=f"rej_reason_{act.action_id}")
+                                        if st.button("❌ Reject Action", key=f"btn_rej_{act.action_id}"):
+                                            try:
+                                                resp_engine.reject_action(act.action_id, actor="ANALYST", reason=rej_reason or "Declined by analyst")
+                                                st.info("Action rejected.")
+                                                st.rerun()
+                                            except Exception as r_err:
+                                                st.error(f"Rejection error: {r_err}")
+
+                                # Execution controls for APPROVED
+                                elif act.status == ActionStatus.APPROVED:
+                                    st.warning("⚠️ **Simulated Containment**: This action changes FlowWatch's simulated containment state only. It does not modify your real firewall, operating system, or network traffic.")
+                                    if st.button("🚀 Execute Simulated Action", key=f"btn_exec_{act.action_id}"):
+                                        try:
+                                            ok, msg, _ = resp_engine.execute_action(act.action_id, actor="ANALYST")
+                                            if ok:
+                                                st.success(f"Simulated execution succeeded: {msg}")
+                                            else:
+                                                st.error(f"Simulated execution failed: {msg}")
+                                            st.rerun()
+                                        except Exception as exec_err:
+                                            st.error(f"Execution failed: {exec_err}")
+
+                                # Verification & Rollback controls for APPLIED
+                                elif act.status == ActionStatus.APPLIED:
+                                    st.caption("ℹ️ *Verification confirms the simulated database state table entry only, not real-world network traffic blocking.*")
+                                    v_btn_col, rb_btn_col = st.columns(2)
+                                    with v_btn_col:
+                                        if st.button("🔄 Re-Verify Simulated State", key=f"btn_ver_{act.action_id}"):
+                                            v_st, v_dt = resp_engine.verify_action(act.action_id, auto_audit=True)
+                                            st.info(f"Verification outcome: {v_st} — {v_dt}")
+                                            st.rerun()
+                                    with rb_btn_col:
+                                        with st.expander("↩️ Rollback Simulated Action"):
+                                            rb_reason = st.text_input("Rollback Reason", key=f"rb_note_{act.action_id}", value="Analyst requested state rollback")
+                                            if st.button("Confirm Rollback", key=f"btn_rb_{act.action_id}"):
+                                                try:
+                                                    rb_ok, rb_msg, _ = resp_engine.rollback_action(act.action_id, actor="ANALYST", reason=rb_reason)
+                                                    if rb_ok:
+                                                        st.success(f"Rollback succeeded: {rb_msg}")
+                                                    else:
+                                                        st.error(f"Rollback failed: {rb_msg}")
+                                                    st.rerun()
+                                                except Exception as rb_err:
+                                                    st.error(f"Rollback error: {rb_err}")
+
+                                st.markdown("<hr style='margin: 0.5rem 0;'>", unsafe_allow_html=True)
+
+    # --- Section G: Global Simulated State & Audit History ---
+    st.markdown("---")
+    st.subheader("🌐 Global Simulated Containment State & Audit History")
+
+    sim_tab1, sim_tab2 = st.tabs(["Active Simulated State (Isolated)", "Historical Audit Trail"])
+
+    with sim_tab1:
+        st.caption("🔒 All containment states below are isolated to the FlowWatch SQLite simulation table. Real host networking and firewall rules are never modified.")
+        sim_col1, sim_col2, sim_col3 = st.columns(3)
+        with sim_col1:
+            st.markdown("**Blocked Source IPs**")
+            b_srcs = resp_engine.get_simulated_blocked_sources()
+            if b_srcs:
+                for ip in b_srcs:
+                    st.markdown(f"- 🔴 `{ip}`")
+            else:
+                st.caption("*No source IPs currently blocked in simulation.*")
+
+        with sim_col2:
+            st.markdown("**Blocked Destination Ports**")
+            b_ports = resp_engine.get_simulated_blocked_ports()
+            if b_ports:
+                for p in b_ports:
+                    st.markdown(f"- 🔴 Port `{p}`")
+            else:
+                st.caption("*No ports currently blocked in simulation.*")
+
+        with sim_col3:
+            st.markdown("**Watched Source IPs**")
+            w_srcs = resp_engine.get_simulated_watchlist()
+            if w_srcs:
+                for w in w_srcs:
+                    st.markdown(f"- 🟡 `{w}`")
+            else:
+                st.caption("*Watchlist is currently empty.*")
+
+    with sim_tab2:
+        st.caption("Append-only immutable audit events log recording all proposals, approvals, executions, and rollbacks.")
+        audit_events = inc_store.get_audit_events(limit=100)
+        if audit_events:
+            audit_rows = []
+            for ev in audit_events:
+                audit_rows.append({
+                    "Timestamp": ev.timestamp[:19].replace("T", " ") if ev.timestamp else "—",
+                    "Actor": ev.actor,
+                    "Event Type": ev.event_type,
+                    "Incident ID": ev.incident_id[:8] + "..." if ev.incident_id else "—",
+                    "Action ID": ev.action_id[:8] + "..." if ev.action_id else "—",
+                    "Description": ev.description,
+                })
+            st.dataframe(pd.DataFrame(audit_rows), width="stretch")
+        else:
+            st.caption("No audit events recorded yet.")
 
 # ---------------- Live auto-refresh ----------------
 if live and mon.running:
